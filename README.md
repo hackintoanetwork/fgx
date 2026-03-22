@@ -18,7 +18,7 @@ Automates the entire pipeline from encrypted `.out` firmware files to a fully ex
 ### Python packages
 
 ```bash
-pip install pyasn1 pyasn1-modules vmlinux-to-elf
+pip3 install -r requirements.txt
 ```
 
 ### System tools
