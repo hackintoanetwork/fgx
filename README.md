@@ -2,15 +2,16 @@
 
 End-to-end FortiGate firmware decryption and extraction toolkit for FortiOS 7.6.x.
 
-Automates the entire pipeline from encrypted `.out` firmware files to a fully extracted root filesystem with a single command. Developed through reverse engineering of FortiOS 7.6.6 (build 3652) firmware encryption, including the discovery of a previously undocumented modified RC4 stream cipher used in the latest FortiOS versions.
+Automates the entire pipeline from encrypted `.out` firmware files to a fully extracted root filesystem with a single command. Supports both aarch64 (ARM64) and x86_64 FortiGate appliances. Developed through reverse engineering of FortiOS 7.6.6 firmware encryption, including the discovery of a previously undocumented modified RC4 stream cipher used in the latest FortiOS versions.
 
 ## Features
 
 - Full pipeline automation: encrypted `.out` file to extracted rootfs in one command
 - FortiCrack-compatible outer layer decryption (known-plaintext XOR block cipher)
-- Automatic kernel (flatkc) crypto material extraction via ELF symbol analysis
+- Architecture-independent kernel crypto material extraction (no symbol resolution required)
 - Novel modified RC4 decryption for FortiOS 7.6.x rootfs.gz (first public implementation)
-- Support for aarch64 (ARM64) FortiGate appliances
+- Support for both aarch64 (ARM64) and x86_64 FortiGate appliances
+- Auto-detection of crypto material layout and cipher variant
 - No GUI required -- fully headless operation
 
 ## Requirements
@@ -18,7 +19,7 @@ Automates the entire pipeline from encrypted `.out` firmware files to a fully ex
 ### Python packages
 
 ```bash
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ### System tools
@@ -75,19 +76,19 @@ The decrypted image contains an MBR partition table with an ext3 filesystem (vol
 | `flatkc` | Linux kernel image (contains crypto material) |
 | `datafs.tar.gz` | Data filesystem (configs, IPS rules, AV signatures) |
 | `split_rootfs.tar.xz` | Additional binaries (node, smbcd, smartctl) |
-| `devicetree.dtb` | Device tree blob |
+| `devicetree.dtb` | Device tree blob (aarch64 only) |
 
 ### Stage 3: Kernel Crypto Material Extraction
 
-The kernel (`flatkc`) is converted to an ELF binary using `vmlinux-to-elf`, which recovers the kallsyms symbol table. fgx then:
+The kernel (`flatkc`) is converted to an ELF binary using `vmlinux-to-elf`, which recovers the kallsyms symbol table.
 
-1. Locates the `rsa_parse_pub_key` symbol
-2. Scans the `.init.text` section for BL (branch-link) instructions targeting this function
-3. Traces backwards from the call site to find ADRP+ADD instruction pairs that load the seed address
-4. Identifies the seed by detecting the `ADD Xn, X0, #0x20` pattern (RSA key = seed + 32 bytes)
-5. Reads the 32-byte seed and 270-byte encrypted RSA public key
-6. XOR-decrypts the RSA key: `decrypted[i] = encrypted[i] ^ seed[i % 32]`
-7. Parses the BER-encoded RSA public key (modulus + exponent)
+fgx uses a pure brute-force binary scan that requires **no symbol resolution or disassembly** -- it works even when `vmlinux-to-elf` produces incorrect symbol addresses (a known issue with FortiOS 7.6.x kernels based on Linux 3.2.16):
+
+1. **Pass 1 (contiguous):** Scans for a 32-byte seed immediately followed by a 270-byte XOR-encrypted RSA public key. Works for aarch64 firmware where `[seed][RSA_key]` are adjacent.
+
+2. **Pass 2 (non-contiguous):** If Pass 1 fails, builds an index of all 2-byte prefixes and searches for seed/RSA pairs separated by up to 512 bytes. Works for x86_64 firmware where the layout is `[RSA_key][18-byte alignment padding][seed]`.
+
+3. **Validation:** Each candidate is XOR-decrypted and checked against the ASN.1 DER structure of an RSA-2048 public key (header `30 82 01 0A 02 82 01 01 00`, exponent `02 03 01 00 01`).
 
 ### Stage 4: rootfs.gz Decryption
 
@@ -96,6 +97,7 @@ The rootfs.gz encryption in FortiOS 7.6.x uses a novel scheme not previously doc
 1. The RSA public key (extracted in Stage 3) decrypts the PKCS#1 v1.5 signature appended to rootfs.gz (last 256 bytes)
 2. The signature payload contains a SHA-256 hash (verified against the encrypted data) and a 32-byte RC4 key
 3. The rootfs data is decrypted using a modified RC4 stream cipher
+4. The cipher variant (PRGA j-initialization) is auto-detected by testing gzip magic on the first 4 decrypted bytes
 
 #### Modified RC4 Algorithm (FortiOS 7.6.x)
 
@@ -125,16 +127,25 @@ FortiOS 7.6.x Modified PRGA:
   output = keystream ^ ciphertext_byte
 ```
 
-This modified PRGA was reverse-engineered from the `sub_73db4c` function in the FortiOS 7.6.6 kernel (`flatkc`), using Capstone disassembler for ARM64 instruction decoding.
+**Compiler variant:** Some kernel builds (e.g., FGT_2500E, FGT_1000D) do not reset `j` to zero before the PRGA, retaining the final KSA value. fgx auto-detects this by testing both modes against the expected gzip header.
+
+#### Crypto Material Layout
+
+The seed and encrypted RSA key are stored differently depending on the architecture:
+
+| Architecture | Layout | Gap |
+|:------------:|--------|:---:|
+| aarch64 | `[seed 32B][RSA 270B]` | 0 |
+| x86_64 | `[RSA 270B][padding 18B][seed 32B]` | 18 (32-byte alignment) |
 
 ## Output Structure
 
 ```
-fgx_output/
+output/
   rootfs/                 Root filesystem (CPIO extracted)
-    sbin/init             FortiOS init process (aarch64 ELF)
-    bin.tar.xz            FortiOS binaries archive (227 binaries)
-    lib/                  Shared libraries (83 .so files)
+    sbin/init             FortiOS init process (ELF)
+    bin.tar.xz            FortiOS binaries archive
+    lib/                  Shared libraries
     node-scripts/         Node.js scripts and native module
     data/                 Configuration data
     var/                  Runtime directories
@@ -142,29 +153,51 @@ fgx_output/
   split_rootfs.tar.xz     Additional binaries (node, smbcd)
   flatkc                  Kernel image (raw)
   rootfs.gz               Encrypted rootfs (original)
-  devicetree.dtb          Device tree blob
 ```
 
 ## Technical Notes
 
 ### FortiOS Binary Architecture
 
-FortiOS uses a monolithic architecture where all major daemons (sslvpnd, httpsd, fgfmd, etc.) are symlinks to a single `init` binary (75MB, ARM aarch64). The binary determines its role based on `argv[0]`.
+FortiOS uses a monolithic architecture where all major daemons (sslvpnd, httpsd, fgfmd, etc.) are symlinks to a single `init` binary. The binary determines its role based on `argv[0]`.
+
+### vmlinux-to-elf Compatibility
+
+FortiOS 7.6.x uses Linux kernel 3.2.16. Some versions of `vmlinux-to-elf` produce incorrect symbol addresses due to a base address detection issue (the decompressed kernel has a 1MB boot setup prefix that shifts all symbol mappings). fgx does not rely on symbol resolution -- the brute-force binary scan works regardless of symbol correctness.
+
+For best results with external analysis tools, install the known-good version:
+
+```bash
+pip install git+https://github.com/marin-m/vmlinux-to-elf.git@fa5c9305ae
+```
 
 ### Tested Firmware
 
 | Model | Version | Build | Architecture | Status |
-|-------|---------|-------|--------------|--------|
-| FortiGate 60F | FortiOS 7.6.6 | 3652 | ARM aarch64 | Fully supported |
+|-------|---------|-------|:------------:|:------:|
+| FortiGate 60F | FortiOS 7.6.6 | 3652 | aarch64 | Fully supported |
+| FortiGate 201E | FortiOS 7.6.6 | 3652 | x86_64 | Fully supported |
+| FortiGate 1100E | FortiOS 7.6.6 | 3652 | x86_64 | Fully supported |
+| FortiGate 2500E | FortiOS 7.6.6 | 3652 | x86_64 | Fully supported |
+| FortiGate 1000D | FortiOS 7.6.6 | 6605 | x86_64 | Fully supported |
 
 ### Comparison with Existing Tools
 
-| Tool | Outer Layer | rootfs.gz | Architecture |
-|------|:-----------:|:---------:|:------------:|
-| FortiCrack (Bishop Fox) | Yes | No | x86/ARM |
-| fortigate-crypto (Optistream) | No | ChaCha20 (7.4.x) | x86/ARM |
-| decrypt-fortigate-rootfs (RandoriSec) | No | AES-CTR (7.4.7) | x86 only |
-| **fgx** | **Yes** | **Modified RC4 (7.6.x)** | **aarch64** |
+| Tool | Outer Layer | rootfs.gz | FortiOS Version | Architecture |
+|------|:-----------:|:---------:|:---------------:|:------------:|
+| FortiCrack (Bishop Fox) | Yes | No | All | x86/ARM |
+| fortigate-crypto (Optistream) | No | ChaCha20 | 7.4.2-7.4.3 | x86/ARM |
+| decrypt-fortigate-rootfs (RandoriSec) | No | AES-CTR | 7.4.7 | x86 only |
+| **fgx** | **Yes** | **Modified RC4** | **7.6.x** | **aarch64 + x86_64** |
+
+### Cipher Evolution Across FortiOS Versions
+
+| FortiOS Version | rootfs Cipher | RSA Key Protection | Key Derivation |
+|:---------------:|:-------------:|:------------------:|:--------------:|
+| 7.0.x | ChaCha20 | N/A (static key) | None |
+| 7.4.2-7.4.3 | ChaCha20 | ChaCha20 from seed | SHA-256 rotation |
+| 7.4.3-7.4.7 | AES-256-CTR | ChaCha20 from seed | SHA-256 rotation |
+| **7.6.x** | **Modified RC4** | **XOR with seed** | **From RSA signature** |
 
 ## References
 
