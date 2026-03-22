@@ -1,0 +1,4 @@
+pyasn1
+pyasn1-modules
+vmlinux-to-elf
+capstone
