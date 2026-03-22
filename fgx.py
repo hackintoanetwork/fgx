@@ -205,8 +205,9 @@ def stage2_extract_fs(image_data, output_dir, verbose=False):
     if "flatkc" not in extracted:
         raise RuntimeError("flatkc not found in filesystem")
 
-    # Clean up ext image
-    os.remove(ext_path)
+    # Clean up ext image (unless keep_intermediate)
+    if not os.environ.get("FGX_KEEP_EXT"):
+        os.remove(ext_path)
 
     return extracted
 
@@ -235,153 +236,279 @@ def convert_flatkc_to_elf(flatkc_path, elf_path):
     return arch
 
 
-def parse_elf_symbols(elf_data):
-    """Parse ELF symbol table. Returns dict of addr -> name."""
-    # ELF64 header
-    e_shoff = struct.unpack_from("<Q", elf_data, 40)[0]
-    e_shentsize = struct.unpack_from("<H", elf_data, 58)[0]
-    e_shnum = struct.unpack_from("<H", elf_data, 60)[0]
-    e_shstrndx = struct.unpack_from("<H", elf_data, 62)[0]
 
-    # Section headers
-    sections = []
-    for i in range(e_shnum):
-        off = e_shoff + i * e_shentsize
-        sh_name = struct.unpack_from("<I", elf_data, off)[0]
-        sh_type = struct.unpack_from("<I", elf_data, off + 4)[0]
-        sh_addr = struct.unpack_from("<Q", elf_data, off + 16)[0]
-        sh_offset = struct.unpack_from("<Q", elf_data, off + 24)[0]
-        sh_size = struct.unpack_from("<Q", elf_data, off + 32)[0]
-        sh_link = struct.unpack_from("<I", elf_data, off + 40)[0]
-        sh_entsize = struct.unpack_from("<Q", elf_data, off + 56)[0]
-        sections.append({
-            "name_idx": sh_name, "type": sh_type, "addr": sh_addr,
-            "offset": sh_offset, "size": sh_size, "link": sh_link,
-            "entsize": sh_entsize,
-        })
+def _try_xor_rsa(seed, enc):
+    """Check if 270-byte enc XOR'd with 32-byte seed yields valid RSA DER."""
+    d0 = enc[0] ^ seed[0]
+    d1 = enc[1] ^ seed[1]
+    if d0 != 0x30 or d1 != 0x82:
+        return None
+    d2 = enc[2] ^ seed[2]
+    d3 = enc[3] ^ seed[3]
+    if (d2 << 8 | d3) != 0x010A:
+        return None
+    if (enc[4] ^ seed[4]) != 0x02:
+        return None
+    if (enc[5] ^ seed[5]) != 0x82:
+        return None
+    if ((enc[6] ^ seed[6]) << 8 | (enc[7] ^ seed[7])) != 0x0101:
+        return None
+    dec = bytearray(270)
+    for i in range(270):
+        dec[i] = enc[i] ^ seed[i & 0x1F]
+    if dec[265:270] == b"\x02\x03\x01\x00\x01":
+        return bytes(dec)
+    return None
 
-    # Find symbol table and string table
-    symtab = None
-    strtab_data = None
-    for sec in sections:
-        if sec["type"] == 2:  # SHT_SYMTAB
-            symtab = sec
-            strtab_sec = sections[sec["link"]]
-            strtab_data = elf_data[strtab_sec["offset"]:strtab_sec["offset"] + strtab_sec["size"]]
+
+def find_seed_and_rsa_universal(elf_data, verbose=False):
+    """Architecture-independent seed + RSA key search.
+
+    Scans the entire ELF binary for a 32-byte seed and a 270-byte
+    XOR-encrypted RSA public key.  Supports both contiguous layout
+    (aarch64: seed immediately followed by RSA key) and non-contiguous
+    layout (x86_64: seed and RSA key separated by a small gap).
+    """
+    elf_len = len(elf_data)
+
+    # Pass 1: contiguous seed(32) + RSA(270)
+    for offset in range(0, elf_len - 302):
+        seed = elf_data[offset : offset + 32]
+        if seed == b"\x00" * 32 or len(set(seed)) < 8:
+            continue
+        enc = elf_data[offset + 32 : offset + 32 + 270]
+        if len(enc) < 270:
+            break
+        dec = _try_xor_rsa(seed, enc)
+        if dec:
+            if verbose:
+                print(f"    Seed at ELF offset 0x{offset:x} (contiguous)")
+            return seed, dec
+
+    # Pass 2: non-contiguous — RSA key before seed with small gap
+    # In x86_64 FortiOS, RSA key(270) + gap(≤64) + seed(32)
+    if verbose:
+        print("    Pass 1 (contiguous) failed, trying non-contiguous...")
+
+    # Build index: for each possible seed, compute expected first 2 bytes of encrypted RSA
+    # If enc[0]^seed[0]==0x30 and enc[1]^seed[1]==0x82, then enc[0]=seed[0]^0x30
+    # We index by (enc[0], enc[1]) = (seed[0]^0x30, seed[1]^0x82)
+    enc_prefix_index = {}
+    for offset in range(0, elf_len - 270):
+        key2 = (elf_data[offset], elf_data[offset + 1])
+        if key2 not in enc_prefix_index:
+            enc_prefix_index[key2] = []
+        enc_prefix_index[key2].append(offset)
+
+    for offset in range(0, elf_len - 32):
+        seed = elf_data[offset : offset + 32]
+        if seed == b"\x00" * 32 or len(set(seed)) < 12:
+            continue
+        # Compute expected first 2 bytes of encrypted RSA key
+        expected = (seed[0] ^ 0x30, seed[1] ^ 0x82)
+        if expected not in enc_prefix_index:
+            continue
+        for rsa_offset in enc_prefix_index[expected]:
+            # Skip if contiguous (already checked in pass 1)
+            if rsa_offset == offset + 32:
+                continue
+            # Only check nearby (within 512 bytes before or after seed)
+            dist = abs(rsa_offset - offset)
+            if dist > 512 or dist < 32:
+                continue
+            enc = elf_data[rsa_offset : rsa_offset + 270]
+            if len(enc) < 270:
+                continue
+            dec = _try_xor_rsa(seed, enc)
+            if dec:
+                if verbose:
+                    print(f"    Seed at 0x{offset:x}, RSA at 0x{rsa_offset:x} (gap={dist-32 if rsa_offset<offset else dist-270})")
+                return seed, dec
+
+    return None, None
+
+
+def find_seed_and_rsa_chacha20(elf_path, verbose=False):
+    """Find seed and RSA key using miasm + ChaCha20 (x86_64 fallback).
+
+    Uses the RandoriSec/nurfed1 approach:
+    1. Find fgt_verify_initrd function via objdump/miasm
+    2. Extract ChaCha20 key/IV from SHA256 call parameters
+    3. Decrypt RSA public key with ChaCha20
+    """
+    try:
+        from miasm.core.locationdb import LocationDB
+        from miasm.analysis.binary import Container
+        from miasm.analysis.machine import Machine
+        from hashlib import sha256
+        from Crypto.Cipher import ChaCha20
+    except ImportError:
+        return None, None, None
+
+    loc_db = LocationDB()
+    container = Container.from_stream(open(elf_path, "rb"), loc_db)
+
+    # Try to find fgt_verifier_pub_key symbol (FortiOS 7.4.2-7.4.3)
+    fgt_addr = None
+    for sym_name in ["fgt_verifier_pub_key", "fgt_verify_initrd", "fgt_verify_decrypt"]:
+        try:
+            fgt_addr = loc_db.get_name_offset(sym_name)
+            if verbose:
+                print(f"    Found {sym_name} at {hex(fgt_addr)}")
+            break
+        except Exception:
+            continue
+
+    if fgt_addr is None:
+        # Try RandoriSec approach: find via objdump
+        try:
+            output = subprocess.check_output(
+                f"""objdump -d --section=.init.text {elf_path} 2>/dev/null |
+                egrep "rsa_parse_pub_key|push.*rbp" |
+                egrep "rsa_parse_pub_key" -B1 |
+                head -1 |
+                cut -d':' -f1""",
+                shell=True, text=True,
+            ).strip()
+            if output:
+                fgt_addr = int(output, 16)
+                if verbose:
+                    print(f"    Found verify function at {hex(fgt_addr)} via objdump")
+        except Exception:
+            pass
+
+    if fgt_addr is None:
+        # Try searching .kernel section
+        try:
+            output = subprocess.check_output(
+                f"""objdump -d --section=.kernel {elf_path} 2>/dev/null |
+                egrep "rsa_parse_pub_key|push.*rbp" |
+                egrep "rsa_parse_pub_key" -B1 |
+                head -1 |
+                cut -d':' -f1""",
+                shell=True, text=True, timeout=120,
+            ).strip()
+            if output:
+                fgt_addr = int(output, 16)
+                if verbose:
+                    print(f"    Found verify function at {hex(fgt_addr)} via objdump (.kernel)")
+        except Exception:
+            pass
+
+    if fgt_addr is None:
+        return None, None, None
+
+    machine = Machine(container.arch)
+    mdis = machine.dis_engine(container.bin_stream, loc_db=container.loc_db)
+
+    # Disassemble from the found address
+    try:
+        asmcfg = mdis.dis_multiblock(fgt_addr)
+    except Exception:
+        return None, None, None
+
+    # Search for MOV RSI (seed address) and MOV RDX (RSA key address)
+    rsi_values = []
+    rdx_values = []
+    for block in asmcfg.blocks:
+        for instr in block.lines:
+            if instr.name == "MOV":
+                dst, src = instr.get_args_expr()
+                if dst.is_id() and dst.name == "RSI" and src.is_int():
+                    rsi_values.append(src.arg)
+                if dst.is_id() and dst.name == "RDX" and src.is_int():
+                    rdx_values.append(src.arg)
+
+    if not rsi_values or not rdx_values:
+        return None, None, None
+
+    seed_addr = min(rsi_values)
+    rsapubkey_addr = rdx_values[0]
+
+    if verbose:
+        print(f"    Seed address: {hex(seed_addr)}")
+        print(f"    RSA key address: {hex(rsapubkey_addr)}")
+
+    # Read seed and encrypted RSA key
+    virt = container.executable.get_virt()
+    seed = virt.get(seed_addr, seed_addr + 32)
+    enc_rsa = virt.get(rsapubkey_addr, rsapubkey_addr + 270)
+
+    # Try multiple ChaCha20 key derivation split points
+    split_combos = [
+        (5, 2), (4, 5), (3, 1), (5, 5), (2, 5),
+        (1, 3), (3, 2), (4, 2), (5, 3), (2, 3),
+    ]
+
+    for key_split, iv_split in split_combos:
+        sha_key = sha256(seed[key_split:] + seed[:key_split]).digest()
+        sha_iv = sha256(seed[iv_split:] + seed[:iv_split]).digest()[:16]
+
+        try:
+            chacha = ChaCha20.new(key=sha_key, nonce=sha_iv[4:])
+            counter = int.from_bytes(sha_iv[:4], "little")
+            chacha.seek(counter * 64)
+            dec = chacha.decrypt(enc_rsa)
+        except Exception:
+            continue
+
+        if dec[:4] == b"\x30\x82\x01\x0A" and dec[265:270] == b"\x02\x03\x01\x00\x01":
+            if verbose:
+                print(f"    ChaCha20 split: key={key_split}, iv={iv_split}")
+            return seed, bytes(dec), "chacha20_aesctr"
+
+    # Try dynamic extraction (nurfed1 approach for 7.6.x)
+    rsi_edx_pairs = []
+    for block in asmcfg.blocks:
+        if "sha256_update" not in block.to_string():
+            continue
+        rsi_val, edx_val = 0, 0
+        for instr in block.lines:
+            if instr.name == "MOV":
+                dst, src = instr.get_args_expr()
+                dst_name = None
+                if dst.is_id():
+                    dst_name = dst.name
+                elif dst.is_slice() and dst.arg.is_id():
+                    base = dst.arg.name.upper()
+                    start, stop = dst.start, dst.stop
+                    if base == "RDX" and start == 0 and stop == 32:
+                        dst_name = "EDX"
+                    elif base == "RSI" and start == 0 and stop == 64:
+                        dst_name = "RSI"
+                if dst_name == "RSI" and src.is_int():
+                    rsi_val = src.arg
+                if dst_name == "EDX" and src.is_int():
+                    edx_val = src.arg
+        rsi_edx_pairs.append((rsi_val, edx_val))
+        if len(rsi_edx_pairs) == 4:
             break
 
-    if not symtab or not strtab_data:
-        return {}, {}
+    if len(rsi_edx_pairs) == 4:
+        try:
+            sha_key_hash = sha256()
+            sha_key_hash.update(virt.get(rsi_edx_pairs[0][0], rsi_edx_pairs[0][0] + rsi_edx_pairs[0][1]))
+            sha_key_hash.update(virt.get(rsi_edx_pairs[1][0], rsi_edx_pairs[1][0] + rsi_edx_pairs[1][1]))
+            chacha_key = sha_key_hash.digest()
 
-    symbols = {}  # addr -> name
-    symbols_by_name = {}  # name -> addr
-    num_syms = symtab["size"] // symtab["entsize"]
-    for i in range(num_syms):
-        off = symtab["offset"] + i * symtab["entsize"]
-        st_name = struct.unpack_from("<I", elf_data, off)[0]
-        st_value = struct.unpack_from("<Q", elf_data, off + 8)[0]
-        # Get symbol name
-        end = strtab_data.index(b"\x00", st_name)
-        name = strtab_data[st_name:end].decode("ascii", errors="ignore")
-        if name and st_value:
-            symbols[st_value] = name
-            symbols_by_name[name] = st_value
+            sha_iv_hash = sha256()
+            sha_iv_hash.update(virt.get(rsi_edx_pairs[2][0], rsi_edx_pairs[2][0] + rsi_edx_pairs[2][1]))
+            sha_iv_hash.update(virt.get(rsi_edx_pairs[3][0], rsi_edx_pairs[3][0] + rsi_edx_pairs[3][1]))
+            chacha_iv = sha_iv_hash.digest()[:16]
 
-    return symbols, symbols_by_name
+            chacha = ChaCha20.new(key=chacha_key, nonce=chacha_iv[4:])
+            counter = int.from_bytes(chacha_iv[:4], "little")
+            chacha.seek(counter * 64)
+            dec = chacha.decrypt(enc_rsa)
 
+            if dec[:4] == b"\x30\x82\x01\x0A" and dec[265:270] == b"\x02\x03\x01\x00\x01":
+                if verbose:
+                    print(f"    Dynamic ChaCha20 key extraction succeeded")
+                return seed, bytes(dec), "chacha20_aesctr"
+        except Exception:
+            pass
 
-def find_kernel_section(elf_data):
-    """Find the main kernel section's vaddr, file offset, and size."""
-    e_shoff = struct.unpack_from("<Q", elf_data, 40)[0]
-    e_shentsize = struct.unpack_from("<H", elf_data, 58)[0]
-    e_shnum = struct.unpack_from("<H", elf_data, 60)[0]
-    e_shstrndx = struct.unpack_from("<H", elf_data, 62)[0]
-
-    shstr_sec_off = e_shoff + e_shstrndx * e_shentsize
-    shstr_offset = struct.unpack_from("<Q", elf_data, shstr_sec_off + 24)[0]
-
-    for i in range(e_shnum):
-        off = e_shoff + i * e_shentsize
-        sh_name_idx = struct.unpack_from("<I", elf_data, off)[0]
-        sh_addr = struct.unpack_from("<Q", elf_data, off + 16)[0]
-        sh_offset = struct.unpack_from("<Q", elf_data, off + 24)[0]
-        sh_size = struct.unpack_from("<Q", elf_data, off + 32)[0]
-        end = elf_data.index(b"\x00", shstr_offset + sh_name_idx)
-        name = elf_data[shstr_offset + sh_name_idx:end].decode("ascii", errors="ignore")
-        if name in (".kernel", ".text") and sh_size > 0x100000:
-            return sh_addr, sh_offset, sh_size
     return None, None, None
-
-
-def find_seed_aarch64(elf_data, rsa_addr, init_start, init_end, kernel_vaddr, kernel_foff):
-    """Find seed address by scanning init text for BL to rsa_parse_pub_key (aarch64)."""
-    init_foff = kernel_foff + (init_start - kernel_vaddr)
-
-    # Find BL to rsa_parse_pub_key
-    bl_pc = None
-    for i in range(0, init_end - init_start, 4):
-        fpos = init_foff + i
-        insn = struct.unpack_from("<I", elf_data, fpos)[0]
-        if (insn >> 26) == 0x25:  # BL
-            imm26 = insn & 0x3FFFFFF
-            if imm26 & 0x2000000:
-                offset = struct.unpack("q", struct.pack("Q", ((imm26 | ~0x3FFFFFF) << 2) & 0xFFFFFFFFFFFFFFFF))[0]
-            else:
-                offset = imm26 << 2
-            target = (init_start + i + offset) & 0xFFFFFFFFFFFFFFFF
-            if target == rsa_addr:
-                bl_pc = init_start + i
-                break
-
-    if not bl_pc:
-        raise RuntimeError("BL to rsa_parse_pub_key not found in init section")
-
-    # Search backward for ADRP + ADD pattern loading the seed address
-    search_start = bl_pc - 256
-    search_foff = kernel_foff + (search_start - kernel_vaddr)
-
-    seed_addr = None
-    for i in range(0, bl_pc - search_start, 4):
-        fpos = search_foff + i
-        insn = struct.unpack_from("<I", elf_data, fpos)[0]
-        # ADRP
-        if (insn & 0x9F000000) == 0x90000000:
-            rd = insn & 0x1F
-            immhi = (insn >> 5) & 0x7FFFF
-            immlo = (insn >> 29) & 0x3
-            imm = (immhi << 2) | immlo
-            if imm & 0x100000:
-                imm -= 0x200000
-            pc = search_start + i
-            page = ((pc >> 12) + imm) << 12
-
-            # Check next instruction for ADD
-            next_insn = struct.unpack_from("<I", elf_data, fpos + 4)[0]
-            if (next_insn & 0xFFC00000) == 0x91000000:  # ADD (64-bit)
-                add_rd = next_insn & 0x1F
-                add_rn = (next_insn >> 5) & 0x1F
-                add_imm = (next_insn >> 10) & 0xFFF
-                if add_rn == rd:
-                    full_addr = page + add_imm
-                    # Check if next-next is ADD Xn, Xm, #0x20 (RSA key = seed + 32)
-                    next2 = struct.unpack_from("<I", elf_data, fpos + 8)[0]
-                    next2_imm = (next2 >> 10) & 0xFFF
-                    next2_op = (next2 >> 24) & 0xFF
-                    if next2_op == 0x91 and next2_imm == 0x20:
-                        seed_addr = full_addr
-                        break
-
-    if not seed_addr:
-        raise RuntimeError("Seed address not found")
-
-    return seed_addr, bl_pc
-
-
-def find_seed_x86_64(elf_data, rsa_addr, init_start, init_end, kernel_vaddr, kernel_foff):
-    """Find seed address for x86_64 kernels."""
-    # For x86_64, search for CALL to rsa_parse_pub_key and look for
-    # preceding MOV RSI, <immediate> or LEA instructions
-    raise RuntimeError("x86_64 kernel analysis not yet implemented - use forticrack tools")
 
 
 def stage3_kernel_analysis(flatkc_path, output_dir, verbose=False):
@@ -395,53 +522,27 @@ def stage3_kernel_analysis(flatkc_path, output_dir, verbose=False):
     with open(elf_path, "rb") as f:
         elf_data = f.read()
 
-    symbols, symbols_by_name = parse_elf_symbols(elf_data)
-    kernel_vaddr, kernel_foff, kernel_size = find_kernel_section(elf_data)
+    # Method 1: XOR brute-force (works for aarch64 7.6.x)
+    print(f"    Scanning kernel ({len(elf_data)} bytes) for seed + RSA key...")
+    seed, decrypted_rsa = find_seed_and_rsa_universal(elf_data, verbose)
+    cipher_mode = "modified_rc4"
 
-    if not kernel_vaddr:
-        raise RuntimeError("Kernel section not found")
+    # Method 2: ChaCha20 via miasm (fallback for x86_64)
+    if seed is None:
+        print("    XOR method failed, trying ChaCha20 + miasm...")
+        seed, decrypted_rsa, cipher_mode = find_seed_and_rsa_chacha20(elf_path, verbose)
 
-    rsa_addr = symbols_by_name.get("rsa_parse_pub_key")
-    if not rsa_addr:
-        raise RuntimeError("rsa_parse_pub_key symbol not found")
-    if verbose:
-        print(f"    rsa_parse_pub_key at 0x{rsa_addr:x}")
-
-    # Get init text boundaries from symbols
-    init_start = symbols_by_name.get("_sinittext") or symbols_by_name.get("__init_begin")
-    init_end = symbols_by_name.get("_einittext")
-    if not init_start or not init_end:
-        raise RuntimeError("Init section boundaries not found")
-
-    if verbose:
-        print(f"    Init text: 0x{init_start:x} - 0x{init_end:x}")
-
-    if arch == "aarch64":
-        seed_addr, bl_pc = find_seed_aarch64(
-            elf_data, rsa_addr, init_start, init_end, kernel_vaddr, kernel_foff
+    if seed is None:
+        raise RuntimeError(
+            "Seed / RSA key not found in kernel.\n"
+            "    For x86_64 firmware with obfuscated kernels, try:\n"
+            "      pip install miasm pycryptodome\n"
+            "    Or use --skip-rootfs to extract filesystem without decryption."
         )
-    else:
-        seed_addr, bl_pc = find_seed_x86_64(
-            elf_data, rsa_addr, init_start, init_end, kernel_vaddr, kernel_foff
-        )
-
-    print(f"[+] Seed address: 0x{seed_addr:x}")
-
-    # Read seed (32 bytes) and encrypted RSA key (270 bytes at seed+32)
-    seed_foff = kernel_foff + (seed_addr - kernel_vaddr)
-    seed = elf_data[seed_foff : seed_foff + 32]
-    encrypted_rsa = elf_data[seed_foff + 32 : seed_foff + 32 + 270]
 
     if verbose:
         print(f"    Seed: {seed.hex().upper()}")
-
-    # XOR decrypt RSA public key
-    decrypted_rsa = bytearray(270)
-    for i in range(270):
-        decrypted_rsa[i] = encrypted_rsa[i] ^ seed[i & 0x1F]
-
-    if decrypted_rsa[0] != 0x30:
-        raise RuntimeError(f"Decrypted RSA key has invalid ASN.1 tag: 0x{decrypted_rsa[0]:02x}")
+        print(f"    Cipher mode: {cipher_mode}")
 
     # Parse RSA public key
     from pyasn1.codec.ber import decoder
@@ -458,17 +559,21 @@ def stage3_kernel_analysis(flatkc_path, output_dir, verbose=False):
         "modulus": modulus,
         "exponent": exponent,
         "arch": arch,
+        "cipher_mode": cipher_mode,
     }
 
 
 # Stage 4: rootfs.gz Decryption (Modified RC4)
 
-def modified_rc4(key, data, progress_callback=None):
+def modified_rc4(key, data, progress_callback=None, keep_j=False):
     """
     Modified RC4 cipher used in FortiOS 7.6.x
     Standard RC4 KSA + modified PRGA with:
     - Cross-rotated S-box indices (byte bit rotation mixed between i and j)
     - Multi-lookup output generation with XOR constant 0xAA
+
+    keep_j: if True, PRGA starts with j from KSA's final value instead of 0.
+            Some kernel builds (compiled with different optimization) don't reset j.
     """
     # KSA (standard RC4)
     S = list(range(256))
@@ -480,7 +585,7 @@ def modified_rc4(key, data, progress_callback=None):
     # Modified PRGA
     w14 = (-0x56) & 0xFFFFFFFF  # = 0xFFFFFFAA
     i_val = 0
-    j_val = 0
+    j_val = j if keep_j else 0
     result = bytearray(len(data))
     total = len(data)
     last_pct = -1
@@ -527,6 +632,75 @@ def modified_rc4(key, data, progress_callback=None):
     return bytes(result)
 
 
+def decrypt_rootfs_aesctr(rootfs_enc, sig_payload, verbose=False):
+    """Decrypt rootfs.gz using AES-CTR (FortiOS 7.4.3+ / 7.6.x x86_64)."""
+    import ctypes
+    from Crypto.Cipher import AES
+
+    # Parse the signature payload as crypto_ctx struct
+    # FortiOS 7.6.x layout: padding(174) | null(1) | rootfs_hash(32) | counter(16) | aes_key(32)
+    if len(sig_payload) < 255:
+        raise RuntimeError(f"Signature payload too short: {len(sig_payload)} bytes")
+
+    rootfs_hash = sig_payload[175:207]
+    counter = bytearray(sig_payload[207:223])
+    aes_key = bytes(sig_payload[223:255])
+
+    # Verify hash
+    sha = hashlib.sha256()
+    sha.update(rootfs_enc)
+    if sha.digest() != rootfs_hash:
+        # Try 7.4.x layout: padding(174) | null(1) | counter(16) | aes_key(32) | rootfs_hash(32)
+        counter = bytearray(sig_payload[175:191])
+        aes_key = bytes(sig_payload[191:223])
+        rootfs_hash = sig_payload[223:255]
+        if sha.digest() != rootfs_hash:
+            raise RuntimeError("SHA-256 hash mismatch in AES-CTR mode")
+
+    if verbose:
+        print(f"    AES-256 key: {aes_key.hex().upper()}")
+        print(f"    Counter: {counter.hex().upper()}")
+
+    # Calculate counter increment (FortiOS custom)
+    ctr_increment = 0
+    for i in range(16):
+        ctr_increment ^= (counter[i] & 0xF) ^ (counter[i] >> 4)
+    if ctr_increment == 0:
+        ctr_increment = 1
+
+    if verbose:
+        print(f"    Counter increment: {ctr_increment}")
+
+    # AES-CTR decryption
+    cipher = AES.new(aes_key, AES.MODE_ECB)
+    result = bytearray()
+
+    nonce = int.from_bytes(counter[:8], "little")
+    ctr_val = int.from_bytes(counter[8:16], "little")
+
+    total = len(rootfs_enc)
+    blk_off = 0
+    last_pct = -1
+    while blk_off < total:
+        # Build counter block
+        ctr_block = nonce.to_bytes(8, "little") + ctr_val.to_bytes(8, "little")
+        keystream = cipher.encrypt(ctr_block)
+
+        chunk = rootfs_enc[blk_off:blk_off + 16]
+        result.extend(b ^ k for b, k in zip(chunk, keystream))
+
+        ctr_val = (ctr_val + max(ctr_increment, 1)) & 0xFFFFFFFFFFFFFFFF
+        blk_off += 16
+
+        pct = blk_off * 100 // total
+        if pct != last_pct:
+            print(f"\r    Progress: {pct}%", end="", flush=True)
+            last_pct = pct
+
+    print()
+    return bytes(result)
+
+
 def stage4_decrypt_rootfs(rootfs_path, crypto_material, output_dir, verbose=False):
     """Decrypt rootfs.gz using crypto material from kernel."""
     print("[*] Stage 4: rootfs.gz decryption")
@@ -539,6 +713,7 @@ def stage4_decrypt_rootfs(rootfs_path, crypto_material, output_dir, verbose=Fals
 
     modulus = crypto_material["modulus"]
     exponent = crypto_material["exponent"]
+    cipher_mode = crypto_material.get("cipher_mode", "modified_rc4")
 
     # RSA signature decryption
     sig_int = int.from_bytes(rootfs_sig, "big")
@@ -556,38 +731,57 @@ def stage4_decrypt_rootfs(rootfs_path, crypto_material, output_dir, verbose=Fals
 
     if verbose:
         print(f"    Signature payload: {payload_len} bytes")
+        print(f"    Cipher mode: {cipher_mode}")
 
-    # Find the hash in the payload (32 bytes)
-    sha = hashlib.sha256()
-    sha.update(rootfs_enc)
-    actual_hash = sha.digest()
+    if cipher_mode == "chacha20_aesctr":
+        # AES-CTR mode (FortiOS 7.4.3+ / 7.6.x x86_64)
+        print("[+] Decrypting rootfs.gz with AES-CTR...")
+        decrypted = decrypt_rootfs_aesctr(rootfs_enc, payload, verbose)
+    else:
+        # Modified RC4 mode (FortiOS 7.6.x aarch64)
+        # Find the hash in the payload (32 bytes)
+        sha = hashlib.sha256()
+        sha.update(rootfs_enc)
+        actual_hash = sha.digest()
 
-    # Search for the hash in the payload
-    hash_offset = None
-    for i in range(payload_len - 32):
-        if payload[i : i + 32] == actual_hash:
-            hash_offset = i
-            break
+        hash_offset = None
+        for i in range(payload_len - 32):
+            if payload[i : i + 32] == actual_hash:
+                hash_offset = i
+                break
 
-    if hash_offset is None:
-        raise RuntimeError("SHA-256 hash not found in RSA signature")
+        if hash_offset is None:
+            raise RuntimeError("SHA-256 hash not found in RSA signature")
 
-    print("[+] SHA-256 hash verified")
+        print("[+] SHA-256 hash verified")
 
-    # Extract key: the last 32 bytes of the payload
-    rc4_key = payload[-32:]
+        # Extract key: the last 32 bytes of the payload
+        rc4_key = payload[-32:]
 
-    if verbose:
-        print(f"    RC4 key: {rc4_key.hex().upper()}")
+        if verbose:
+            print(f"    RC4 key: {rc4_key.hex().upper()}")
 
-    # Decrypt with modified RC4
-    print(f"[+] Decrypting rootfs.gz ({len(rootfs_enc) / (1024*1024):.1f} MB)...")
+        # Decrypt with modified RC4
+        # Auto-detect j initialization: some kernel builds reset j to 0, others keep KSA's j
+        test_j0 = modified_rc4(rc4_key, rootfs_enc[:4], keep_j=False)
+        test_jk = modified_rc4(rc4_key, rootfs_enc[:4], keep_j=True)
+        if test_j0[:2] == b"\x1f\x8b":
+            keep_j = False
+        elif test_jk[:2] == b"\x1f\x8b":
+            keep_j = True
+        else:
+            raise RuntimeError(f"RC4 decryption failed: neither j=0 ({test_j0[:2].hex()}) nor j=keep ({test_jk[:2].hex()}) produces gzip")
 
-    def progress(pct):
-        print(f"\r    Progress: {pct}%", end="", flush=True)
+        if verbose:
+            print(f"    RC4 j_init: {'keep' if keep_j else 'reset'}")
 
-    decrypted = modified_rc4(rc4_key, rootfs_enc, progress_callback=progress)
-    print()
+        print(f"[+] Decrypting rootfs.gz ({len(rootfs_enc) / (1024*1024):.1f} MB)...")
+
+        def progress(pct):
+            print(f"\r    Progress: {pct}%", end="", flush=True)
+
+        decrypted = modified_rc4(rc4_key, rootfs_enc, progress_callback=progress, keep_j=keep_j)
+        print()
 
     # Verify gzip
     if decrypted[:2] != b"\x1f\x8b":
